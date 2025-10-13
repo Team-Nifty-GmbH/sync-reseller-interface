@@ -25,7 +25,8 @@ class SyncResellerInterfaceWithPlesk extends Command
      */
     protected $signature = 'sync:reseller-to-plesk
                             {--domain= : Specific domain to sync (optional)}
-                            {--dry-run : Show what would be changed without making changes}';
+                            {--dry-run : Show what would be changed without making changes}
+                            {--stop-on-failure : Stop processing domains when a sync fails}';
 
     /**
      * The console command description.
@@ -35,12 +36,14 @@ class SyncResellerInterfaceWithPlesk extends Command
     protected $description = 'Sync DNS records from ResellerInterface to Plesk';
 
     private bool $dryRun = false;
+    private bool $stopOnFailure = false;
     private array $lastSyncDetails = [];
     private array $lastSyncRecords = []; // Store actual records for detailed view
 
     public function handle(): int
     {
         $this->dryRun = $this->option('dry-run');
+        $this->stopOnFailure = $this->option('stop-on-failure');
 
         if (!$this->testConnections()) {
             return self::FAILURE;
@@ -192,6 +195,12 @@ class SyncResellerInterfaceWithPlesk extends Command
                         $this->lastSyncDetails,
                         ['records' => $this->lastSyncRecords]
                     );
+
+                    // Stop processing if --stop-on-failure is set
+                    if ($this->stopOnFailure) {
+                        error("Stopping domain processing due to failure (--stop-on-failure is set)");
+                        break;
+                    }
                 }
             }
 
@@ -330,13 +339,18 @@ class SyncResellerInterfaceWithPlesk extends Command
                             error("❌ Failed Records:");
                             $failedTable = [];
                             foreach ($records['failed'] as $record) {
+                                $error = $record['error'] ?? 'Unknown error';
+                                $statusCode = isset($record['status_code']) ? " (HTTP {$record['status_code']})" : '';
+                                $exception = isset($record['exception']) ? " [{$record['exception']}]" : '';
+
                                 $failedTable[] = [
                                     $record['name'] ?? '',
                                     $record['type'] ?? '',
-                                    Str::limit($record['content'] ?? '', 50),
+                                    Str::limit($record['content'] ?? '', 30),
+                                    Str::limit($error . $statusCode . $exception, 60),
                                 ];
                             }
-                            table(['Name', 'Type', 'Content'], $failedTable);
+                            table(['Name', 'Type', 'Content', 'Error'], $failedTable);
                         }
                     }
 
@@ -700,14 +714,20 @@ class SyncResellerInterfaceWithPlesk extends Command
                             );
 
                             if ($createResponse->failed()) {
-                                $failedRecords[] = $record;
+                                $failedRecords[] = array_merge($record, [
+                                    'error' => $createResponse->body(),
+                                    'status_code' => $createResponse->status()
+                                ]);
                             } else {
                                 $addedCount++;
                                 $addedRecords[] = $record;
                             }
 
                         } catch (Exception $e) {
-                            $failedRecords[] = $record;
+                            $failedRecords[] = array_merge($record, [
+                                'error' => $e->getMessage(),
+                                'exception' => get_class($e)
+                            ]);
                         }
                     }
 
