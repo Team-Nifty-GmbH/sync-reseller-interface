@@ -39,11 +39,15 @@ class SyncResellerInterfaceWithPlesk extends Command
     private bool $stopOnFailure = false;
     private array $lastSyncDetails = [];
     private array $lastSyncRecords = []; // Store actual records for detailed view
+    private ?array $customNsRecords = null;
 
     public function handle(): int
     {
         $this->dryRun = $this->option('dry-run');
         $this->stopOnFailure = $this->option('stop-on-failure');
+
+        // Load custom NS records from environment if configured
+        $this->loadCustomNsRecords();
 
         if (!$this->testConnections()) {
             return self::FAILURE;
@@ -57,6 +61,24 @@ class SyncResellerInterfaceWithPlesk extends Command
         }
 
         return $this->syncAllDomains();
+    }
+
+    private function loadCustomNsRecords(): void
+    {
+        $nsRecordsEnv = env('NS_RECORDS');
+
+        if (empty($nsRecordsEnv)) {
+            return;
+        }
+
+        // Parse comma-separated NS records
+        $nsRecords = array_map('trim', explode(',', $nsRecordsEnv));
+        $nsRecords = array_filter($nsRecords); // Remove empty values
+
+        if (!empty($nsRecords)) {
+            $this->customNsRecords = $nsRecords;
+            info("Custom NS records configured: " . implode(', ', $nsRecords));
+        }
     }
 
     private function testConnections(): bool
@@ -299,6 +321,9 @@ class SyncResellerInterfaceWithPlesk extends Command
                         info("  Records deleted: " . ($details['records_deleted'] ?? 0));
                         info("  Records failed: " . ($details['records_failed'] ?? 0));
                         info("  NS records skipped: " . ($details['records_skipped_ns'] ?? 0));
+                        if (isset($details['custom_ns_added']) && $details['custom_ns_added'] > 0) {
+                            info("  Custom NS records added: " . $details['custom_ns_added']);
+                        }
 
                         // Show deleted records
                         if (!empty($records['deleted'])) {
@@ -565,10 +590,18 @@ class SyncResellerInterfaceWithPlesk extends Command
                     }
                 }
 
-                info("DRY RUN: Would disable ResellerInterface DNS extension");
-                info("DRY RUN: Would delete {$deleteCount} existing records in Plesk (skipping {$nsCount} NS records)");
-                info("DRY RUN: Would add {$addCount} records from ResellerInterface (excluding NS records)");
-                info("DRY RUN: Would re-enable ResellerInterface DNS extension");
+                $customNsCount = $this->customNsRecords ? count($this->customNsRecords) : 0;
+
+                info("DRY RUN: Sync sequence overview");
+                info("──────────────────────────────────");
+                if ($customNsCount > 0) {
+                    info("STEP 1/3: Would add {$customNsCount} custom NS record(s) from .env configuration");
+                }
+                info("STEP 2/3: Would delete {$deleteCount} existing non-NS records + " . ($nsCount - $customNsCount) . " old NS records in Plesk");
+                if ($customNsCount > 0) {
+                    info("          (keeping {$customNsCount} custom NS records from .env)");
+                }
+                info("STEP 3/3: Would add {$addCount} records from ResellerInterface (excluding NS records)");
                 return self::SUCCESS;
             }
 
@@ -576,30 +609,85 @@ class SyncResellerInterfaceWithPlesk extends Command
             // For single domain sync, we need to handle it here
             $needsExtensionHandling = true; // We'll check if we're in single domain mode
 
+            // Store Plesk records for detail view
+            $this->lastSyncRecords['plesk_before'] = $pleskDnsRecords;
+            $this->lastSyncRecords['deleted'] = [];
+            $this->lastSyncRecords['custom_ns_added'] = [];
+
+            // STEP 1: Add custom NS records FIRST (before deleting anything)
+            // This ensures Plesk always has at least one NS record
+            $customNsAddedCount = 0;
+            $customNsRecordValues = []; // Track the NS records we added
+
+            if ($this->customNsRecords) {
+                info("Step 1/3: Adding custom NS records from configuration...");
+                $domainNameClean = rtrim($domainName, '.');
+
+                foreach ($this->customNsRecords as $nsRecord) {
+                    try {
+                        $nsHost = $domainNameClean . '.';
+                        $nsValue = rtrim($nsRecord, '.') . '.';
+                        $customNsRecordValues[] = strtolower($nsValue); // Store for comparison later
+
+                        $createResponse = plesk()->dns()->createDomainOrDomainAliasDnsRecord(
+                            type: DnsRecordType::NS,
+                            host: $nsHost,
+                            value: $nsValue,
+                            opt: null,
+                            ttl: 86400,
+                            domain: $domainName
+                        );
+
+                        if ($createResponse->ok()) {
+                            $customNsAddedCount++;
+                            $this->lastSyncRecords['custom_ns_added'][] = [
+                                'name' => $domainNameClean,
+                                'type' => 'NS',
+                                'content' => $nsRecord,
+                                'ttl' => 86400
+                            ];
+                        } else {
+                            warning("Failed to add custom NS record {$nsRecord}: " . $createResponse->body());
+                        }
+                    } catch (Exception $e) {
+                        warning("Failed to add custom NS record {$nsRecord}: " . $e->getMessage());
+                    }
+                }
+
+                if ($customNsAddedCount > 0) {
+                    info("Added {$customNsAddedCount} custom NS record(s)");
+                }
+            }
+
+            // STEP 2: Delete all records EXCEPT our custom NS records
             // Store existing records for potential rollback
             $backupRecords = [];
             foreach ($pleskDnsRecords as $pleskRecord) {
+                // Only backup non-NS records (NS records will be managed via .env)
                 if (strtoupper($pleskRecord['type'] ?? '') !== 'NS') {
                     $backupRecords[] = $pleskRecord;
                 }
             }
 
-            // Store Plesk records for detail view
-            $this->lastSyncRecords['plesk_before'] = $pleskDnsRecords;
-            $this->lastSyncRecords['deleted'] = [];
+            info("Step 2/3: Deleting existing DNS records...");
 
             $deletedCount = spin(
-                function() use ($pleskDnsRecords, &$backupRecords) {
+                function() use ($pleskDnsRecords, $customNsRecordValues, &$backupRecords) {
                     $deleted = 0;
                     $deletedRecords = [];
                     foreach ($pleskDnsRecords as $pleskRecord) {
                         try {
                             $recordType = $pleskRecord['type'] ?? '';
                             $recordId = $pleskRecord['id'] ?? null;
+                            $recordValue = strtolower($pleskRecord['value'] ?? '');
 
-                            // Skip NS records - they should not be deleted
+                            // Skip NS records that match our custom NS records from .env
                             if (strtoupper($recordType) === 'NS') {
-                                continue;
+                                if (in_array($recordValue, $customNsRecordValues)) {
+                                    // This is one of our custom NS records, keep it
+                                    continue;
+                                }
+                                // This is an old NS record not in our .env, delete it
                             }
 
                             if ($recordId) {
@@ -618,10 +706,12 @@ class SyncResellerInterfaceWithPlesk extends Command
                     $this->lastSyncRecords['deleted'] = $deletedRecords;
                     return $deleted;
                 },
-                'Deleting existing DNS records in Plesk (excluding NS records)...'
+                'Deleting existing DNS records (keeping custom NS records)...'
             );
 
             info("Deleted {$deletedCount} existing DNS records");
+
+            info("Step 3/3: Adding DNS records from ResellerInterface...");
 
             // Store details for later display
             $this->lastSyncDetails = [
@@ -745,17 +835,18 @@ class SyncResellerInterfaceWithPlesk extends Command
             $skippedNsCount = $result['skippedNs'];
             $failedRecords = $result['failed'];
 
-            // Update sync details with final counts
-            $this->lastSyncDetails['records_added'] = $addedCount;
+            // Update sync details with final counts (custom NS were already added in STEP 1)
+            $this->lastSyncDetails['records_added'] = $addedCount + $customNsAddedCount;
             $this->lastSyncDetails['records_failed'] = count($failedRecords);
             $this->lastSyncDetails['records_skipped_ns'] = $skippedNsCount;
+            $this->lastSyncDetails['custom_ns_added'] = $customNsAddedCount;
             $this->lastSyncRecords['added'] = $result['addedRecords'] ?? [];
             $this->lastSyncRecords['failed'] = $failedRecords;
 
-            info("Added {$addedCount} DNS records");
+            info("Added {$addedCount} DNS records from ResellerInterface");
 
             if ($skippedNsCount > 0) {
-                info("Skipped {$skippedNsCount} NS records");
+                info("Skipped {$skippedNsCount} NS records from ResellerInterface");
             }
 
             $totalProcessed = count($riRecords) - $skippedNsCount;
