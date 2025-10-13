@@ -671,8 +671,8 @@ class SyncResellerInterfaceWithPlesk extends Command
                             $opt = null;
 
                             // MX records - priority goes in opt
-                            if ($type === 'MX' && isset($record['priority'])) {
-                                $opt = (string)$record['priority'];
+                            if ($type === 'MX') {
+                                $opt = (string)($record['priority'] ?? '10');
                             }
 
                             // SRV records - special handling
