@@ -111,7 +111,7 @@ Nach der Synchronisation kann in einer interaktiven Suche jede Domain ausgewähl
 
 ## Anforderungen
 
-- PHP 8.2 oder höher
+- PHP 8.4 oder höher
 - Composer
 - Zugriff auf Plesk Server (via API)
 - Zugriff auf ResellerInterface API
